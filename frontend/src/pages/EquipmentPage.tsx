@@ -23,7 +23,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, TARGET_COLOR, isReplacedOriginal, isReplacementSession } from '../types';
 import { axisMinutes, minutesToTime } from '../utils/astro';
 
 const SLOT_MINUTES = 30;
@@ -45,7 +45,10 @@ export default function EquipmentPage() {
   const [nightId, setNightId] = useState(currentNightId);
   const activeNightId = nightId || currentNightId;
   const night = nights.find((item) => item.id === activeNightId);
-  const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === activeNightId), [sessions, activeNightId]);
+  const nightSessions = useMemo(
+    () => sessions.filter((session) => session.nightId === activeNightId && !isReplacedOriginal(session)),
+    [sessions, activeNightId],
+  );
   const conflicts = useMemo(() => conflictsOfNight(activeNightId), [conflictsOfNight, activeNightId]);
   const slots = useMemo(() => Array.from({ length: NIGHT_TOTAL_MINUTES / SLOT_MINUTES }, (_, index) => index), []);
 
@@ -109,6 +112,12 @@ export default function EquipmentPage() {
         </Alert>
       )}
 
+      <Stack direction="row" spacing={1} sx={{ mb: 1.5 }} flexWrap="wrap" useFlexGap>
+        <Chip size="small" variant="outlined" label="常规段：目标色实心格" />
+        <Chip size="small" color="secondary" variant="outlined" label="替补段：紫色虚线框、格前缀「替·」" />
+        <Chip size="small" variant="outlined" label="已改期的原段不占用网格（仅在排程段列表留痕）" />
+      </Stack>
+
       <TableContainer component={Paper} variant="outlined" sx={{ mb: 3 }}>
         <Table size="small" sx={{ minWidth: 1180 }}>
           <TableHead>
@@ -153,6 +162,7 @@ export default function EquipmentPage() {
                     const items = occupancy(telescope.id, slot);
                     const isConflict = items.length > 1;
                     const target = items[0] ? targetById(items[0].targetId) : undefined;
+                    const hasReplacement = items.some((item) => isReplacementSession(item));
                     return (
                       <TableCell
                         key={slot}
@@ -164,7 +174,10 @@ export default function EquipmentPage() {
                           color: items.length ? '#fff' : 'text.secondary',
                           cursor: items.length ? 'pointer' : 'default',
                           borderLeft: '1px solid',
+                          borderRight: hasReplacement && !isConflict ? '2px dashed #fff' : undefined,
                           borderColor: 'divider',
+                          outline: hasReplacement && !isConflict ? '2px dashed rgba(106,74,158,.9)' : undefined,
+                          outlineOffset: -2,
                         }}
                         onClick={() => {
                           if (items.length === 0) return;
@@ -180,8 +193,13 @@ export default function EquipmentPage() {
                             </Typography>
                           </Tooltip>
                         ) : (
-                          <Tooltip title={`${items[0].startTime}-${items[0].endTime} ${target?.name ?? ''} · ${items[0].status}`}>
+                          <Tooltip
+                            title={`${items[0].startTime}-${items[0].endTime} ${target?.name ?? ''} · ${items[0].status}${
+                              isReplacementSession(items[0]) ? ' · 替补段' : ''
+                            }`}
+                          >
                             <Typography variant="caption" sx={{ whiteSpace: 'nowrap' }}>
+                              {isReplacementSession(items[0]) ? '替·' : ''}
                               {target?.name ?? '已排'}
                             </Typography>
                           </Tooltip>

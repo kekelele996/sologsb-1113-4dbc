@@ -14,6 +14,8 @@ export interface TimelineBar {
   color: string;
   tooltip?: string;
   dimmed?: boolean;
+  /** 替补段：虚线描边 +「替」角标；原段：标灰留痕 */
+  kind?: '常规段' | '原段' | '替补段';
 }
 
 export interface TimelineProps {
@@ -85,6 +87,8 @@ export default function Timeline({
             const leftPct = (bar.startMinute / totalMinutes) * 100;
             const widthPct = ((bar.endMinute - bar.startMinute) / totalMinutes) * 100;
             const conflict = conflictIds?.has(bar.id) ?? false;
+            const isReplacement = bar.kind === '替补段';
+            const isOriginal = bar.kind === '原段';
             return (
               <Tooltip key={bar.id} title={bar.tooltip ?? bar.label}>
                 <Box
@@ -103,13 +107,14 @@ export default function Timeline({
                     py: 0.5,
                     cursor: onBarClick ? 'pointer' : 'default',
                     opacity: bar.dimmed ? 0.42 : 1,
-                    border: conflict ? '2px solid' : '1px solid rgba(255,255,255,.35)',
+                    border: conflict ? '2px solid' : isReplacement ? '2px dashed #fff' : '1px solid rgba(255,255,255,.35)',
                     borderColor: conflict ? 'error.dark' : undefined,
                     overflow: 'hidden',
                     boxShadow: 1,
                   }}
                 >
                   <Typography variant="caption" sx={{ display: 'block', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                    {isReplacement ? '替 · ' : isOriginal ? '原 · ' : ''}
                     {bar.label}
                   </Typography>
                   <Typography variant="caption" sx={{ display: 'block', whiteSpace: 'nowrap', opacity: 0.9 }}>

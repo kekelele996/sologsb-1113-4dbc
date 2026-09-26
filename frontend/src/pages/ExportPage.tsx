@@ -17,7 +17,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, TARGET_COLOR, isReplacedOriginal, sessionKind } from '../types';
 import { axisMinutes, timelineTicks } from '../utils/astro';
 import { buildNightPlanText, buildPlanCsv, downloadText, printPage } from '../utils/export';
 
@@ -58,10 +58,11 @@ export default function ExportPage() {
           id: session.id,
           startMinute,
           endMinute: Math.max(startMinute + 20, Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= startMinute ? rawEnd + 1440 : rawEnd)),
-          label: target?.name ?? '未知目标',
+          label: `${sessionKind(session) === '替补段' ? '替·' : ''}${target?.name ?? '未知目标'}`,
+          kind: sessionKind(session),
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
-          dimmed: session.status === '因云取消',
-          tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}`,
+          dimmed: isReplacedOriginal(session),
+          tooltip: `${sessionKind(session)}｜${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}`,
         };
       }),
     [nightSessions, targets],

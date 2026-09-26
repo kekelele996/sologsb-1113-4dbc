@@ -94,8 +94,13 @@ export interface VisibilityWindow {
  */
 export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes = 10): VisibilityWindow | null {
   const base = new Date(`${night.date}T18:00:00`);
-  const from = axisMinutes(night.sunset);
-  const to = axisMinutes(night.sunrise) || NIGHT_TOTAL_MINUTES;
+  // 日落可能略早于 18:00（负刻度），日出可能恰为 06:00（轴终点），不能直接套 axisMinutes
+  const [sunsetH, sunsetM] = night.sunset.split(':').map((v) => Number(v) || 0);
+  const sunsetClock = sunsetH * 60 + sunsetM;
+  const from = sunsetClock >= 12 * 60 ? sunsetClock - NIGHT_START_MINUTES : sunsetClock + (1440 - NIGHT_START_MINUTES);
+  let to = axisMinutes(night.sunrise);
+  if (to <= 0) to += 1440;
+  to = to || NIGHT_TOTAL_MINUTES;
   const samples: Array<{ axis: number; altitude: number }> = [];
   for (let axis = from; axis <= to; axis += stepMinutes) {
     const date = new Date(base.getTime() + axis * 60_000);

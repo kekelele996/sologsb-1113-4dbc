@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { useSessionStore } from '../stores/sessionStore';
-import type { ConflictItem, ObsSession } from '../types';
+import { isReplacedOriginal, type ConflictItem, type ObsSession } from '../types';
 import { overlapMinutes } from '../utils/astro';
 
 export interface ConflictCheckInput {
@@ -23,6 +23,10 @@ export interface ConflictCheckApi {
 
 function describe(a: ObsSession, b: ObsSession): ConflictItem | null {
   if (a.nightId !== b.nightId || a.telescopeId !== b.telescopeId || a.id === b.id) {
+    return null;
+  }
+  // 已生成替补段的原段只作留痕，不再占用设备、不计入冲突
+  if (isReplacedOriginal(a) || isReplacedOriginal(b)) {
     return null;
   }
   const overlap = overlapMinutes(a.startTime, a.endTime, b.startTime, b.endTime);

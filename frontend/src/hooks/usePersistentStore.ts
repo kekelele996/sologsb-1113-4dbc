@@ -1,12 +1,13 @@
 import Dexie, { type Table } from 'dexie';
 import { useEffect, useState } from 'react';
 import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import { planReschedule } from '../utils/reschedule';
 
 /** IndexedDB 库名（浏览器本地存储，无后端） */
 export const DB_NAME = 'gbobsplan-db';
 
 /** 当前数据结构版本，写入每条记录并用于升级迁移判定 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 class ObsPlanDB extends Dexie {
   targets!: Table<ObsTarget, string>;
@@ -53,6 +54,88 @@ class ObsPlanDB extends Dexie {
             if (!row.backupNightId && row.status === '因云取消' && backupNight) {
               row.backupNightId = backupNight.id;
             }
+          });
+      });
+
+    // v3：引入替补段——原段保留并标记 kind='原段'/replacedById，备用夜上新增 kind='替补段' 的实际执行段
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions:
+          'id, nightId, targetId, telescopeId, instrumentId, startTime, status, backupNightId, originalSessionId, replacedById',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        const [nights, targets, telescopes, sessions] = (await Promise.all([
+          tx.table('nights').toArray(),
+          tx.table('targets').toArray(),
+          tx.table('telescopes').toArray(),
+          tx.table('sessions').toArray(),
+        ])) as [ObsNight[], ObsTarget[], Telescope[], ObsSession[]];
+
+        // 已挂替补夜的「因云取消」原段：按可见窗口 + 设备空闲生成替补段（规划失败则保留原段不动）
+        const origins = sessions.filter(
+          (session) => session.status === '因云取消' && session.backupNightId && !session.originalSessionId,
+        );
+        const groups = new Map<string, ObsSession[]>();
+        origins.forEach((session) => {
+          const list = groups.get(session.backupNightId as string) ?? [];
+          list.push(session);
+          groups.set(session.backupNightId as string, list);
+        });
+
+        const replacements: ObsSession[] = [];
+        const updatedOrigins: ObsSession[] = [];
+        let seq = 1;
+        for (const [backupNightId, sources] of groups) {
+          const backupNight = nights.find((night) => night.id === backupNightId);
+          if (!backupNight) continue;
+          const rows = planReschedule({ sources: [...sources].sort((a, b) => a.id.localeCompare(b.id)), backupNight, sessions, targets, telescopes });
+          rows.forEach((row) => {
+            if (!row.startTime || !row.endTime) return;
+            const replacementId = `s-mig-${String(seq).padStart(2, '0')}`;
+            seq += 1;
+            const processedAt = new Date(`${backupNight.date}T12:00:00`).toISOString();
+            replacements.push({
+              id: replacementId,
+              nightId: backupNight.id,
+              targetId: row.source.targetId,
+              startTime: row.startTime,
+              endTime: row.endTime,
+              telescopeId: row.source.telescopeId,
+              instrumentId: row.source.instrumentId,
+              filterSlot: row.source.filterSlot,
+              plannedFrames: row.source.plannedFrames,
+              status: '待执行',
+              kind: '替补段',
+              rescheduleReason: row.source.rescheduleReason,
+              originalSessionId: row.source.id,
+              originalNightId: row.source.nightId,
+              processedAt,
+              schemaVersion: SCHEMA_VERSION,
+            });
+            // 原段保留原夜 / 原时段 / 原因，并指向替补段（写回表，不再占用设备）
+            updatedOrigins.push({
+              ...row.source,
+              kind: '原段',
+              replacedById: replacementId,
+              processedAt,
+              schemaVersion: SCHEMA_VERSION,
+            });
+          });
+        }
+
+        if (replacements.length > 0) {
+          await tx.table('sessions').bulkPut([...updatedOrigins, ...replacements]);
+        }
+        await tx
+          .table('sessions')
+          .toCollection()
+          .modify((row: ObsSession) => {
+            if (row.schemaVersion !== SCHEMA_VERSION) row.schemaVersion = SCHEMA_VERSION;
           });
       });
   }
@@ -116,23 +199,60 @@ const SEED_INSTRUMENTS: Instrument[] = [
   { id: 'ins-004', model: 'Shelyak Lhires III', terminalType: '光谱仪', pixelSizeUm: 9, sensorWidthMm: 8, sensorHeightMm: 6, readNoiseE: 4, telescopeCode: 'T-03' },
 ];
 
-/** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录 */
-const SEED_SESSIONS: ObsSession[] = [
-  { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-04', nightId: 'night-001', targetId: 'target-007', startTime: '21:30', endTime: '23:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 35, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '与窄带目标争用 T-02，待改期' },
-  { id: 's-05', nightId: 'night-001', targetId: 'target-009', startTime: '23:10', endTime: '00:20', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'OIII', plannedFrames: 28, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-06', nightId: 'night-001', targetId: 'target-008', startTime: '00:30', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-07', nightId: 'night-001', targetId: 'target-011', startTime: '02:10', endTime: '03:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 120, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-08', nightId: 'night-001', targetId: 'target-010', startTime: '03:10', endTime: '04:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: '无滤镜', plannedFrames: 300, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-10', nightId: 'night-002', targetId: 'target-005', startTime: '19:50', endTime: '21:40', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 50, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-11', nightId: 'night-002', targetId: 'target-004', startTime: '21:50', endTime: '23:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '因云取消', schemaVersion: SCHEMA_VERSION, rescheduleReason: '夜间云量转多云，目标被云遮挡，改期至备用夜', backupNightId: 'night-003' },
-  { id: 's-12', nightId: 'night-002', targetId: 'target-012', startTime: '23:40', endTime: '01:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'SII', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '目标地平高度偏低，视情况顺延' },
-  { id: 's-13', nightId: 'night-002', targetId: 'target-010', startTime: '01:10', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 240, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
-];
+/**
+ * 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条已改期记录：
+ * s-11 因云取消并保留在原夜（原段），s-15 是其在备用夜 night-003 上的替补段，
+ * 时段由可见窗口与设备空闲区间规划得出（NGC 7000 最早 18:00 起）。
+ */
+const SEED_S11_PROCESSED_AT = '2025-10-12T23:40:00.000Z';
+
+function buildSeedSessions(): ObsSession[] {
+  const sessions: ObsSession[] = [
+    { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-04', nightId: 'night-001', targetId: 'target-007', startTime: '21:30', endTime: '23:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 35, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION, rescheduleReason: '与窄带目标争用 T-02，待改期' },
+    { id: 's-05', nightId: 'night-001', targetId: 'target-009', startTime: '23:10', endTime: '00:20', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'OIII', plannedFrames: 28, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-06', nightId: 'night-001', targetId: 'target-008', startTime: '00:30', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-07', nightId: 'night-001', targetId: 'target-011', startTime: '02:10', endTime: '03:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 120, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-08', nightId: 'night-001', targetId: 'target-010', startTime: '03:10', endTime: '04:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: '无滤镜', plannedFrames: 300, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '已完成', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-10', nightId: 'night-002', targetId: 'target-005', startTime: '19:50', endTime: '21:40', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 50, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-11', nightId: 'night-002', targetId: 'target-004', startTime: '21:50', endTime: '23:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '因云取消', kind: '原段', schemaVersion: SCHEMA_VERSION, rescheduleReason: '夜间云量转多云，目标被云遮挡，改期至备用夜', backupNightId: 'night-003', replacedById: 's-15', processedAt: SEED_S11_PROCESSED_AT },
+    { id: 's-12', nightId: 'night-002', targetId: 'target-012', startTime: '23:40', endTime: '01:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'SII', plannedFrames: 30, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION, rescheduleReason: '目标地平高度偏低，视情况顺延' },
+    { id: 's-13', nightId: 'night-002', targetId: 'target-010', startTime: '01:10', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 240, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+    { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', kind: '常规段', schemaVersion: SCHEMA_VERSION },
+  ];
+
+  const backupNight = SEED_NIGHTS.find((night) => night.id === 'night-003');
+  const origin = sessions.find((session) => session.id === 's-11');
+  if (backupNight && origin) {
+    const [row] = planReschedule({ sources: [origin], backupNight, sessions, targets: SEED_TARGETS, telescopes: SEED_TELESCOPES });
+    if (row.startTime && row.endTime) {
+      sessions.push({
+        id: 's-15',
+        nightId: backupNight.id,
+        targetId: origin.targetId,
+        startTime: row.startTime,
+        endTime: row.endTime,
+        telescopeId: origin.telescopeId,
+        instrumentId: origin.instrumentId,
+        filterSlot: origin.filterSlot,
+        plannedFrames: origin.plannedFrames,
+        status: '待执行',
+        kind: '替补段',
+        rescheduleReason: origin.rescheduleReason,
+        originalSessionId: origin.id,
+        originalNightId: origin.nightId,
+        processedAt: SEED_S11_PROCESSED_AT,
+        schemaVersion: SCHEMA_VERSION,
+      });
+    }
+  }
+  return sessions;
+}
+
+const SEED_SESSIONS: ObsSession[] = buildSeedSessions();
 
 /** 首次打开（表内无数据）时写入示例数据 */
 export async function seedIfEmpty(): Promise<void> {
