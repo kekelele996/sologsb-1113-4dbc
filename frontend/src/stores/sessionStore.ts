@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { db, deleteRow, persistRow, SCHEMA_VERSION } from '../hooks/usePersistentStore';
+import { db, deleteRow, persistRow, persistRows, SCHEMA_VERSION } from '../hooks/usePersistentStore';
 import { uid } from '../utils/id';
+import type { MakeupPlanItem } from '../utils/makeup';
 import type { ObsSession, SessionStatus } from '../types';
 
 export interface SessionInput {
@@ -24,8 +25,8 @@ interface SessionState {
   addSession: (input: SessionInput) => Promise<ObsSession>;
   updateSession: (id: string, patch: Partial<SessionInput>) => Promise<void>;
   removeSession: (id: string) => Promise<void>;
-  /** 批量改期到备用观测夜并填写改期原因 */
-  rescheduleToBackup: (ids: string[], backupNightId: string, reason: string) => Promise<number>;
+  /** 按预排结果生成替补段：原段置为「因云取消」并记录替补夜、原因与处理时间 */
+  applyMakeupReschedule: (plans: MakeupPlanItem[], backupNightId: string, reason: string) => Promise<{ created: number; failed: number }>;
   updateStatus: (id: string, status: SessionStatus) => Promise<void>;
 }
 
@@ -73,20 +74,51 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
     set({ sessions: get().sessions.filter((session) => session.id !== id) });
   },
 
-  rescheduleToBackup: async (ids, backupNightId, reason) => {
-    const targets = get().sessions.filter((session) => ids.includes(session.id));
-    const updated = targets.map((session) => ({
-      ...session,
-      backupNightId,
-      status: '因云取消' as SessionStatus,
-      rescheduleReason: reason.trim() || '改期至备用观测夜',
-      schemaVersion: SCHEMA_VERSION,
-    }));
-    for (const session of updated) {
-      await persistRow('sessions', session);
+  applyMakeupReschedule: async (plans, backupNightId, reason) => {
+    const now = new Date().toISOString();
+    const trimmedReason = reason.trim() || '改期至备用观测夜';
+    const okPlans = plans.filter((plan) => plan.ok && plan.startTime && plan.endTime);
+    const makeups: ObsSession[] = [];
+    const updatedOriginals: ObsSession[] = [];
+    for (const plan of okPlans) {
+      const original = get().sessions.find((session) => session.id === plan.sessionId);
+      if (!original) continue;
+      // 替补段：排在备用夜新时段，保留原段、原夜、原因与处理时间
+      makeups.push({
+        id: uid('s'),
+        nightId: backupNightId,
+        targetId: original.targetId,
+        startTime: plan.startTime as string,
+        endTime: plan.endTime as string,
+        telescopeId: original.telescopeId,
+        instrumentId: original.instrumentId,
+        filterSlot: original.filterSlot,
+        plannedFrames: original.plannedFrames,
+        status: '待执行',
+        rescheduleReason: trimmedReason,
+        makeupOfSessionId: original.id,
+        originalNightId: original.nightId,
+        rescheduledAt: now,
+        schemaVersion: SCHEMA_VERSION,
+      });
+      // 原段：置为因云取消并记录替补夜，此后不再计入设备冲突
+      updatedOriginals.push({
+        ...original,
+        status: '因云取消',
+        backupNightId,
+        rescheduleReason: trimmedReason,
+        rescheduledAt: now,
+        schemaVersion: SCHEMA_VERSION,
+      });
     }
-    set({ sessions: get().sessions.map((session) => updated.find((item) => item.id === session.id) ?? session) });
-    return updated.length;
+    await persistRows('sessions', [...updatedOriginals, ...makeups]);
+    set({
+      sessions: [
+        ...get().sessions.map((session) => updatedOriginals.find((item) => item.id === session.id) ?? session),
+        ...makeups,
+      ],
+    });
+    return { created: makeups.length, failed: plans.length - okPlans.length };
   },
 
   updateStatus: async (id, status) => {

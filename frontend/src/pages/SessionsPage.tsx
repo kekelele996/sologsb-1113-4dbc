@@ -31,6 +31,7 @@ import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { formatDateTime, planMakeupBatch } from '../utils/makeup';
 
 interface SessionFormState {
   nightId: string;
@@ -45,14 +46,14 @@ interface SessionFormState {
   rescheduleReason: string;
 }
 
-/** 排程段列表与冲突检测结果，支持批量改期到备用观测夜 */
+/** 排程段列表与冲突检测结果，支持批量改期到备用观测夜（生成替补段） */
 export default function SessionsPage() {
   usePersistentStore();
   const sessions = useSessionStore((s) => s.sessions);
   const addSession = useSessionStore((s) => s.addSession);
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
-  const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const applyMakeupReschedule = useSessionStore((s) => s.applyMakeupReschedule);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
@@ -89,6 +90,14 @@ export default function SessionsPage() {
 
   const conflictSet = useMemo(() => conflictIds(), [conflictIds]);
   const backupNights = useMemo(() => nights.filter((night) => night.backup), [nights]);
+  /** 原段 ID → 已生成的替补段（用于追溯展示与重复改期拦截） */
+  const makeupByOrigin = useMemo(() => {
+    const map = new Map<string, (typeof sessions)[number]>();
+    sessions.forEach((session) => {
+      if (session.makeupOfSessionId) map.set(session.makeupOfSessionId, session);
+    });
+    return map;
+  }, [sessions]);
 
   const visible = useMemo(() => {
     return [...sessions]
@@ -181,16 +190,33 @@ export default function SessionsPage() {
     setDialogOpen(false);
   }
 
+  /** 勾选的排程段与改期预排结果（选定备用夜后实时计算，确认前可逐条核对） */
+  const selectedSessions = useMemo(() => sessions.filter((session) => selected.includes(session.id)), [sessions, selected]);
+  const rescheduleBackupNight = nights.find((night) => night.id === rescheduleNight);
+  const makeupPlans = useMemo(() => {
+    if (!rescheduleOpen || !rescheduleBackupNight) return [];
+    return planMakeupBatch({ selected: selectedSessions, allSessions: sessions, targets, telescopes, backupNight: rescheduleBackupNight });
+  }, [rescheduleOpen, rescheduleBackupNight, selectedSessions, sessions, targets, telescopes]);
+  const okPlanCount = makeupPlans.filter((plan) => plan.ok).length;
+
   async function submitReschedule() {
     if (!rescheduleNight) {
       setError('请选择备用观测夜');
       return;
     }
-    const count = await rescheduleToBackup(selected, rescheduleNight, rescheduleReason);
-    setNotice(`已将 ${count} 个排程段改期至 ${nightById(rescheduleNight)?.date ?? rescheduleNight}，原因：${rescheduleReason || '未填写'}`);
-    setSelected([]);
+    const result = await applyMakeupReschedule(makeupPlans, rescheduleNight, rescheduleReason);
+    const failed = makeupPlans.filter((plan) => !plan.ok);
+    const date = nightById(rescheduleNight)?.date ?? rescheduleNight;
+    setNotice(
+      `已在 ${date} 生成 ${result.created} 段替补排程（原段置为因云取消，不再计入设备冲突）` +
+        (failed.length ? `；${failed.length} 段未安排：${failed.map((plan) => `${plan.sessionId}（${plan.failReason}）`).join('；')}` : ''),
+    );
+    // 未安排的段保持勾选，方便换备用夜重试
+    setSelected(failed.map((plan) => plan.sessionId));
     setRescheduleOpen(false);
     setRescheduleReason('');
+    setRescheduleNight('');
+    setError('');
   }
 
   return (
@@ -199,7 +225,7 @@ export default function SessionsPage() {
         排程段列表与冲突检测
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
+        同一时段同一望远镜重复排入即进入冲突列表；勾选多个排程段可批量改期到备用观测夜：按原时长在目标可见窗口与望远镜空闲区间内安排最早时段并生成替补段，无法安排的段逐条说明原因。
       </Typography>
 
       {notice ? (
@@ -218,7 +244,15 @@ export default function SessionsPage() {
         <Button variant="contained" onClick={openCreate}>
           新增排程段
         </Button>
-        <Button variant="outlined" color="warning" disabled={selected.length === 0} onClick={() => setRescheduleOpen(true)}>
+        <Button
+          variant="outlined"
+          color="warning"
+          disabled={selected.length === 0}
+          onClick={() => {
+            setError('');
+            setRescheduleOpen(true);
+          }}
+        >
           批量改期到备用夜（已选 {selected.length}）
         </Button>
         <TextField select size="small" label="观测夜" value={nightFilter} onChange={(event) => setNightFilter(event.target.value)} sx={{ minWidth: 200 }}>
@@ -260,7 +294,7 @@ export default function SessionsPage() {
               <TableCell align="right">帧数</TableCell>
               <TableCell>状态</TableCell>
               <TableCell>冲突</TableCell>
-              <TableCell>改期原因</TableCell>
+              <TableCell>改期 / 替补</TableCell>
               <TableCell align="right">操作</TableCell>
             </TableRow>
           </TableHead>
@@ -303,22 +337,47 @@ export default function SessionsPage() {
                   <TableCell>{session.filterSlot}</TableCell>
                   <TableCell align="right">{session.plannedFrames}</TableCell>
                   <TableCell>
-                    <StatusChip status={session.status} />
+                    <Stack direction="row" spacing={0.5} alignItems="center">
+                      <StatusChip status={session.status} />
+                      {session.makeupOfSessionId ? <Chip size="small" color="info" label="替补" /> : null}
+                    </Stack>
                   </TableCell>
                   <TableCell>
                     <ConflictBadge conflicts={conflicts} compact />
                   </TableCell>
                   <TableCell>
-                    {session.rescheduleReason ? (
-                      <Typography variant="caption">{session.rescheduleReason}</Typography>
-                    ) : (
-                      <Typography variant="caption" color="text.secondary">
-                        -
-                      </Typography>
-                    )}
-                    {session.backupNightId ? (
-                      <Chip size="small" variant="outlined" label={`替补 ${nightById(session.backupNightId)?.date ?? session.backupNightId}`} sx={{ ml: 0.5 }} />
-                    ) : null}
+                    <Stack spacing={0.5} alignItems="flex-start">
+                      {session.makeupOfSessionId ? (
+                        <Chip
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                          label={`替补段 · 原夜 ${nightById(session.originalNightId ?? '')?.date ?? session.originalNightId ?? '-'} · 原段 ${session.makeupOfSessionId}`}
+                        />
+                      ) : null}
+                      {session.backupNightId ? (
+                        <Chip size="small" variant="outlined" label={`替补夜 ${nightById(session.backupNightId)?.date ?? session.backupNightId}`} />
+                      ) : null}
+                      {makeupByOrigin.get(session.id) ? (
+                        <Chip
+                          size="small"
+                          color="success"
+                          variant="outlined"
+                          label={`已替补到 ${nightById(makeupByOrigin.get(session.id)?.nightId ?? '')?.date ?? '-'} ${makeupByOrigin.get(session.id)?.startTime}-${makeupByOrigin.get(session.id)?.endTime}`}
+                        />
+                      ) : null}
+                      {session.rescheduleReason ? <Typography variant="caption">{session.rescheduleReason}</Typography> : null}
+                      {session.rescheduledAt ? (
+                        <Typography variant="caption" color="text.secondary">
+                          处理于 {formatDateTime(session.rescheduledAt)}
+                        </Typography>
+                      ) : null}
+                      {!session.makeupOfSessionId && !session.backupNightId && !session.rescheduleReason && !makeupByOrigin.get(session.id) ? (
+                        <Typography variant="caption" color="text.secondary">
+                          -
+                        </Typography>
+                      ) : null}
+                    </Stack>
                   </TableCell>
                   <TableCell align="right">
                     <Button size="small" onClick={() => openEdit(session.id)}>
@@ -440,11 +499,17 @@ export default function SessionsPage() {
         </DialogActions>
       </Dialog>
 
-      <Dialog open={rescheduleOpen} onClose={() => setRescheduleOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={rescheduleOpen} onClose={() => setRescheduleOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle>批量改期到备用观测夜</DialogTitle>
         <DialogContent>
+          {error ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              {error}
+            </Alert>
+          ) : null}
           <Alert severity="info" sx={{ mb: 1.5 }}>
-            已选 {selected.length} 个排程段，改期后状态将置为「因云取消」并记录替补夜与改期原因。
+            已选 {selected.length} 个排程段。确认后：可安排的段按原时长在目标可见窗口与望远镜空闲区间内安排最早时段并生成替补段（保留原段、原夜、原因与处理时间），
+            原段置为「因云取消」且不再计入设备冲突；无法安排的段保持原状并逐条列出原因。
           </Alert>
           <FieldRow label="备用观测夜" required>
             <TextField select size="small" fullWidth value={rescheduleNight} onChange={(event) => setRescheduleNight(event.target.value)}>
@@ -458,11 +523,61 @@ export default function SessionsPage() {
           <FieldRow label="改期原因" required hint="例如：夜间云量转多云，目标被云遮挡">
             <TextField size="small" fullWidth multiline minRows={2} value={rescheduleReason} onChange={(event) => setRescheduleReason(event.target.value)} />
           </FieldRow>
+          {rescheduleBackupNight ? (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1, mb: 0.5 }}>
+                改期预排（{rescheduleBackupNight.date}）：可安排 {okPlanCount} 段 / 共 {makeupPlans.length} 段
+              </Typography>
+              <TableContainer component={Paper} variant="outlined">
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>排程段</TableCell>
+                      <TableCell>目标</TableCell>
+                      <TableCell>原夜 / 原时段</TableCell>
+                      <TableCell>预排结果</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {makeupPlans.map((plan) => {
+                      const session = sessions.find((item) => item.id === plan.sessionId);
+                      if (!session) return null;
+                      return (
+                        <TableRow key={plan.sessionId}>
+                          <TableCell>{plan.sessionId}</TableCell>
+                          <TableCell>{targetById(session.targetId)?.name ?? '未知目标'}</TableCell>
+                          <TableCell>
+                            {nightById(session.nightId)?.date ?? session.nightId} {session.startTime}-{session.endTime}
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                              原时长 {formatMinutes(durationMinutes(session.startTime, session.endTime))}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            {plan.ok ? (
+                              <Chip size="small" color="success" label={`新时段 ${plan.startTime}-${plan.endTime}`} />
+                            ) : (
+                              <Typography variant="caption" color="error.main">
+                                {plan.failReason}
+                              </Typography>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </>
+          ) : (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              选定备用观测夜后，将在此逐条显示预排时段或无法安排的原因
+            </Alert>
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
-          <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
-            确认改期
+          <Button variant="contained" color="warning" disabled={!rescheduleNight || okPlanCount === 0} onClick={() => void submitReschedule()}>
+            确认生成替补段（{okPlanCount}）
           </Button>
         </DialogActions>
       </Dialog>

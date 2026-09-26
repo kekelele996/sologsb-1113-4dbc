@@ -21,8 +21,16 @@ export interface ConflictCheckApi {
   hasConflict: (sessionId: string) => boolean;
 }
 
+/** 是否计入设备占用：因云取消的原段已改期到替补段，不再占用设备、不参与冲突检测 */
+function occupiesEquipment(session: ObsSession): boolean {
+  return session.status !== '因云取消';
+}
+
 function describe(a: ObsSession, b: ObsSession): ConflictItem | null {
   if (a.nightId !== b.nightId || a.telescopeId !== b.telescopeId || a.id === b.id) {
+    return null;
+  }
+  if (!occupiesEquipment(a) || !occupiesEquipment(b)) {
     return null;
   }
   const overlap = overlapMinutes(a.startTime, a.endTime, b.startTime, b.endTime);

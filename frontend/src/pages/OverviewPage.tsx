@@ -19,7 +19,8 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
-import { altitudeAt, axisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
+import { altitudeAt, axisMinutes, clampedAxisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
+import { formatDateTime } from '../utils/makeup';
 
 /** 本夜编排总览：30 分钟刻度时间轴 + 月相与月出月落条带 + 冲突与标灰提示 */
 export default function OverviewPage() {
@@ -37,6 +38,15 @@ export default function OverviewPage() {
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
+  /** 原段 ID → 替补段（全量排程中查找，用于在总览标注「已替补到」） */
+  const makeupByOrigin = useMemo(() => {
+    const map = new Map<string, (typeof sessions)[number]>();
+    sessions.forEach((session) => {
+      if (session.makeupOfSessionId) map.set(session.makeupOfSessionId, session);
+    });
+    return map;
+  }, [sessions]);
+  const nightById = (id: string) => nights.find((item) => item.id === id);
 
   /** 以夜间 22:00 作为高度角评估时刻 */
   const evaluateDate = useMemo(() => new Date(`${night?.date ?? '2025-10-11'}T22:00:00`), [night?.date]);
@@ -62,22 +72,28 @@ export default function OverviewPage() {
         const startMinute = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, axisMinutes(session.startTime)));
         const rawEnd = axisMinutes(session.endTime);
         const endMinute = Math.max(startMinute + 20, Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= startMinute ? rawEnd + 1440 : rawEnd));
+        const isMakeup = Boolean(session.makeupOfSessionId);
         return {
           id: session.id,
           startMinute,
           endMinute,
-          label: `${target?.name ?? '未知目标'} · ${telescopeById(session.telescopeId)?.code ?? '-'}`,
+          label: `${isMakeup ? '替·' : ''}${target?.name ?? '未知目标'} · ${telescopeById(session.telescopeId)?.code ?? '-'}`,
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
           dimmed: session.status === '因云取消' || Boolean(altitude?.below),
           tooltip: `${session.startTime}-${session.endTime} ${target?.name ?? ''}｜${telescopeById(session.telescopeId)?.code ?? '-'} / ${
             instrumentById(session.instrumentId)?.model ?? '-'
-          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
+          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°${
+            isMakeup
+              ? `｜替补段：原夜 ${nightById(session.originalNightId ?? '')?.date ?? '-'}（原段 ${session.makeupOfSessionId}），改期处理 ${formatDateTime(session.rescheduledAt)}`
+              : ''
+          }`,
         };
       }),
-    [nightSessions, targets, altitudes, telescopes, instruments],
+    [nightSessions, targets, altitudes, telescopes, instruments, nights],
   );
 
   const totalFrames = nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0);
+  const makeupCount = nightSessions.filter((session) => session.makeupOfSessionId).length;
   const dimmedTargets = useMemo(
     () => Array.from(new Set(nightSessions.map((session) => session.targetId))).filter((id) => altitudes.get(id)?.below),
     [nightSessions, altitudes],
@@ -103,7 +119,7 @@ export default function OverviewPage() {
         本夜编排总览
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰。
+        按 30 分钟刻度展示时间轴与已排程段，月相与月出月落条带悬浮于时间轴上方；低于最小地平高度阈值的目标自动标灰；替补段以「替·」前缀标出，因云取消的原段不再占用设备。
       </Typography>
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
@@ -120,13 +136,23 @@ export default function OverviewPage() {
         <ConflictBadge conflicts={conflicts} />
       </Stack>
 
-      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' }, gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2, mb: 2 }}>
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
               本夜排程段
             </Typography>
             <Typography variant="h5">{nightSessions.length}</Typography>
+          </CardContent>
+        </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              替补段
+            </Typography>
+            <Typography variant="h5" color={makeupCount ? 'info.main' : 'text.primary'}>
+              {makeupCount}
+            </Typography>
           </CardContent>
         </Card>
         <Card variant="outlined">
@@ -222,7 +248,7 @@ export default function OverviewPage() {
                 key={marker.label}
                 sx={{
                   position: 'absolute',
-                  left: Math.min(99, Math.max(0, (axisMinutes(marker.time) / NIGHT_TOTAL_MINUTES) * 100)) + '%',
+                  left: Math.min(99, Math.max(0, (clampedAxisMinutes(marker.time) / NIGHT_TOTAL_MINUTES) * 100)) + '%',
                   top: 0,
                   bottom: 0,
                   borderLeft: '1px solid #ffd54f',
@@ -260,6 +286,21 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`滤镜 ${session.filterSlot}`} />
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
+                      {session.makeupOfSessionId ? (
+                        <Chip
+                          size="small"
+                          color="info"
+                          label={`替补段 · 原夜 ${nightById(session.originalNightId ?? '')?.date ?? '-'} · 处理于 ${formatDateTime(session.rescheduledAt)}`}
+                        />
+                      ) : null}
+                      {makeupByOrigin.get(session.id) ? (
+                        <Chip
+                          size="small"
+                          color="success"
+                          variant="outlined"
+                          label={`已替补到 ${nightById(makeupByOrigin.get(session.id)?.nightId ?? '')?.date ?? '-'} ${makeupByOrigin.get(session.id)?.startTime}-${makeupByOrigin.get(session.id)?.endTime}`}
+                        />
+                      ) : null}
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}

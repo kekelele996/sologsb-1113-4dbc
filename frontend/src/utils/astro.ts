@@ -42,6 +42,20 @@ export function axisMinutes(hhmm: string): number {
   return clock >= NIGHT_START_MINUTES ? clock - NIGHT_START_MINUTES : clock + (1440 - NIGHT_START_MINUTES);
 }
 
+/**
+ * 夜间事件时刻（日落 / 月出月落 / 日出）→ 时间轴刻度，并钳制到 0~NIGHT_TOTAL_MINUTES：
+ * 日落在 18:00 前会被 axisMinutes 卷到「次日」，实际应视为时间轴起点之前（0）；
+ * 日出晚于 06:00 同理视为终点（720）。
+ */
+export function clampedAxisMinutes(hhmm: string): number {
+  const axis = axisMinutes(hhmm);
+  if (axis > NIGHT_TOTAL_MINUTES) {
+    const hour = Number(hhmm.split(':')[0]) || 0;
+    return hour >= 12 ? 0 : NIGHT_TOTAL_MINUTES;
+  }
+  return axis;
+}
+
 /** 时间轴刻度 → 'HH:mm' */
 export function minutesToTime(axis: number): string {
   const total = ((NIGHT_START_MINUTES + axis) % 1440 + 1440) % 1440;
@@ -82,6 +96,10 @@ export interface VisibilityWindow {
   startText: string;
   /** 可观测结束时刻 HH:mm */
   endText: string;
+  /** 窗口起点时间轴刻度（18:00 起算分钟） */
+  startAxis: number;
+  /** 窗口终点时间轴刻度 */
+  endAxis: number;
   /** 最大地平高度角（度） */
   maxAltitude: number;
   /** 可观测时长（分钟） */
@@ -90,12 +108,13 @@ export interface VisibilityWindow {
 
 /**
  * 本地计算目标的可见窗口：从日落到日出每 stepMinutes 采样地平高度角，
- * 取连续满足最小高度阈值的区间。
+ * 取连续满足最小高度阈值的区间。日落日出先经 clampedAxisMinutes 钳制到时间轴范围内，
+ * 避免日落早于 18:00 时被卷到「次日」导致采样区间为空。
  */
 export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes = 10): VisibilityWindow | null {
   const base = new Date(`${night.date}T18:00:00`);
-  const from = axisMinutes(night.sunset);
-  const to = axisMinutes(night.sunrise) || NIGHT_TOTAL_MINUTES;
+  const from = clampedAxisMinutes(night.sunset);
+  const to = clampedAxisMinutes(night.sunrise) || NIGHT_TOTAL_MINUTES;
   const samples: Array<{ axis: number; altitude: number }> = [];
   for (let axis = from; axis <= to; axis += stepMinutes) {
     const date = new Date(base.getTime() + axis * 60_000);
@@ -108,6 +127,8 @@ export function visibilityWindow(target: ObsTarget, night: ObsNight, stepMinutes
   return {
     startText: minutesToTime(startAxis),
     endText: minutesToTime(endAxis),
+    startAxis,
+    endAxis,
     maxAltitude: Number(Math.max(...visible.map((sample) => sample.altitude)).toFixed(1)),
     durationMinutes: endAxis - startAxis,
   };

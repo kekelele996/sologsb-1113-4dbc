@@ -52,12 +52,12 @@ export default function EquipmentPage() {
   const targetById = (id: string) => targets.find((target) => target.id === id);
   const pairedInstrument = (telescopeCode: string) => instruments.find((instrument) => instrument.telescopeCode === telescopeCode);
 
-  /** 某望远镜在某时段内的排程段 */
+  /** 某望远镜在某时段内的排程段（因云取消的原段不再占用设备，不计入占用） */
   const occupancy = (telescopeId: string, slot: number) => {
     const slotStart = slot * SLOT_MINUTES;
     const slotEnd = slotStart + SLOT_MINUTES;
     return nightSessions
-      .filter((session) => session.telescopeId === telescopeId)
+      .filter((session) => session.telescopeId === telescopeId && session.status !== '因云取消')
       .filter((session) => {
         const start = axisMinutes(session.startTime);
         const rawEnd = axisMinutes(session.endTime);
@@ -73,7 +73,7 @@ export default function EquipmentPage() {
         望远镜与终端分配视图
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        以行 = 设备、列 = 30 分钟时段的占用网格呈现；同一望远镜在同一时段排入多段即标红，点击格子可一键跳转到对应排程段。
+        以行 = 设备、列 = 30 分钟时段的占用网格呈现；同一望远镜在同一时段排入多段即标红，点击格子可一键跳转到对应排程段；替补段以虚线框标出，占用按新时段计算，因云取消的原段不再占用设备。
       </Typography>
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
@@ -95,6 +95,7 @@ export default function EquipmentPage() {
           ))}
         </TextField>
         <Chip size="small" label={night ? `月相 ${night.moonPhasePct}% · 云量 ${night.cloudText}` : '未选择观测夜'} />
+        {nightSessions.some((session) => session.makeupOfSessionId) ? <Chip size="small" color="info" variant="outlined" label="虚线框 = 替补段（占用按新时段计算）" /> : null}
         <ConflictBadge conflicts={conflicts} />
       </Stack>
 
@@ -153,6 +154,8 @@ export default function EquipmentPage() {
                     const items = occupancy(telescope.id, slot);
                     const isConflict = items.length > 1;
                     const target = items[0] ? targetById(items[0].targetId) : undefined;
+                    const isMakeup = Boolean(items[0]?.makeupOfSessionId);
+                    const originalNightDate = isMakeup ? nights.find((item) => item.id === items[0].originalNightId)?.date ?? '-' : '';
                     return (
                       <TableCell
                         key={slot}
@@ -165,6 +168,8 @@ export default function EquipmentPage() {
                           cursor: items.length ? 'pointer' : 'default',
                           borderLeft: '1px solid',
                           borderColor: 'divider',
+                          outline: isMakeup ? '2px dashed rgba(255,255,255,0.9)' : 'none',
+                          outlineOffset: isMakeup ? -2 : 0,
                         }}
                         onClick={() => {
                           if (items.length === 0) return;
@@ -180,8 +185,13 @@ export default function EquipmentPage() {
                             </Typography>
                           </Tooltip>
                         ) : (
-                          <Tooltip title={`${items[0].startTime}-${items[0].endTime} ${target?.name ?? ''} · ${items[0].status}`}>
+                          <Tooltip
+                            title={`${isMakeup ? `替补段｜原夜 ${originalNightDate}（原段 ${items[0].makeupOfSessionId}）｜` : ''}${items[0].startTime}-${items[0].endTime} ${
+                              target?.name ?? ''
+                            } · ${items[0].status}`}
+                          >
                             <Typography variant="caption" sx={{ whiteSpace: 'nowrap' }}>
+                              {isMakeup ? '替·' : ''}
                               {target?.name ?? '已排'}
                             </Typography>
                           </Tooltip>
